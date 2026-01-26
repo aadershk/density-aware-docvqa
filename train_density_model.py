@@ -580,6 +580,83 @@ def preprocess_dataset(dataset: Dataset, tokenizer: LayoutLMTokenizerFast) -> Da
 # Memory Cleanup Callback (Aggressive)
 # ============================================================================
 
+class TrainingProgressCallback(TrainerCallback):
+    """
+    Progress visibility callback.
+    Shows explicit progress messages to ensure training is visible.
+    """
+    
+    def __init__(self):
+        self.first_batch_done = False
+        self.epoch_start_time = None
+    
+    def on_train_begin(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        """Called when training begins."""
+        import time
+        self.epoch_start_time = time.time()
+        
+        # Calculate total steps
+        if state.max_steps > 0:
+            total_steps = state.max_steps
+        else:
+            # Estimate from dataset size
+            train_dataloader = kwargs.get('train_dataloader')
+            if train_dataloader:
+                steps_per_epoch = len(train_dataloader)
+            else:
+                # Fallback estimate
+                steps_per_epoch = 0
+            total_steps = steps_per_epoch * args.num_train_epochs if steps_per_epoch > 0 else 0
+        
+        logger.info("=" * 70)
+        logger.info("TRAINING LOOP STARTED")
+        if total_steps > 0:
+            logger.info(f"Total training steps: {total_steps}")
+        if train_dataloader:
+            logger.info(f"Steps per epoch: {len(train_dataloader)}")
+        logger.info("Progress will be logged every 5 steps")
+        logger.info("=" * 70)
+        sys.stdout.flush()
+        return control
+    
+    def on_step_end(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        """Called at the end of each step."""
+        # Show progress after first batch completes
+        if not self.first_batch_done:
+            self.first_batch_done = True
+            logger.info("")
+            logger.info("✓ First batch completed successfully - Training is progressing!")
+            logger.info(f"  Step {state.global_step} | Epoch {state.epoch:.1f}")
+            logger.info("  You should now see regular progress updates every 5 steps")
+            logger.info("")
+            sys.stdout.flush()
+        return control
+    
+    def on_log(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        """Called when logs are written."""
+        # Ensure output is flushed
+        sys.stdout.flush()
+        return control
+
+
 class MemoryCleanupCallback(TrainerCallback):
     """
     Aggressive memory cleanup callback.
@@ -604,6 +681,7 @@ class MemoryCleanupCallback(TrainerCallback):
         if self.step_count % self.log_interval == 0:
             current, max_used = get_vram_usage()
             logger.info(f"Step {state.global_step} | VRAM: {current:.1f}MB / Peak: {max_used:.1f}MB")
+            sys.stdout.flush()
         
         return control
     
@@ -936,17 +1014,81 @@ def safe_train(
     try:
         logger.info("Starting training...")
         print_vram_status("Pre-training | ")
+        sys.stdout.flush()
+        
+        # Calculate expected steps for user feedback
+        num_samples = len(trainer.train_dataset)
+        steps_per_epoch = num_samples // (BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
+        total_steps = steps_per_epoch * trainer.args.num_train_epochs
+        
+        logger.info(f"Training configuration:")
+        logger.info(f"  Samples per epoch: {num_samples}")
+        logger.info(f"  Steps per epoch: ~{steps_per_epoch}")
+        logger.info(f"  Total steps: ~{total_steps}")
+        logger.info(f"  Progress will be logged every {trainer.args.logging_steps} steps")
+        logger.info("")
+        logger.info("Training loop starting now... (this may take a moment for first batch)")
+        sys.stdout.flush()
         
         trainer.train()
         
+        logger.info("")
+        logger.info("=" * 70)
         logger.info("Training completed successfully!")
+        logger.info("=" * 70)
+        sys.stdout.flush()
         return True
         
+    except RuntimeError as e:
+        # Check if it's an OOM error (sometimes wrapped in RuntimeError)
+        if "out of memory" in str(e).lower() or "CUDA out of memory" in str(e):
+            logger.error("=" * 70)
+            logger.error("OUT OF MEMORY ERROR DETECTED")
+            logger.error("=" * 70)
+            logger.error(f"Error: {e}")
+            sys.stdout.flush()
+            
+            # Attempt to save current state
+            logger.info("Attempting to save current state...")
+            try:
+                clear_memory()
+                emergency_dir = output_dir / "emergency_checkpoint"
+                safe_makedirs(emergency_dir)
+                
+                model.save_pretrained(emergency_dir)
+                tokenizer.save_pretrained(emergency_dir)
+                
+                logger.info(f"Emergency checkpoint saved to: {emergency_dir}")
+                logger.info("You can resume training from this checkpoint.")
+                
+            except Exception as save_error:
+                logger.error(f"Failed to save emergency checkpoint: {save_error}")
+            
+            logger.error("=" * 70)
+            logger.error("RECOMMENDATIONS:")
+            logger.error("1. Batch size is already at minimum (1)")
+            logger.error("2. Gradient accumulation is at maximum safe value (16)")
+            logger.error("3. Reduce max_seq_length from 512 to 384 or 256")
+            logger.error("4. Close other GPU-using applications")
+            logger.error("5. Check for memory leaks in custom code")
+            logger.error("=" * 70)
+            sys.stdout.flush()
+            
+            return False
+        else:
+            # Re-raise non-OOM RuntimeErrors
+            logger.error(f"RuntimeError during training: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            sys.stdout.flush()
+            raise
+    
     except torch.cuda.OutOfMemoryError as e:
         logger.error("=" * 70)
         logger.error("OUT OF MEMORY ERROR DETECTED (torch.cuda.OutOfMemoryError)")
         logger.error("=" * 70)
         logger.error(f"Error: {e}")
+        sys.stdout.flush()
         
         # Attempt to save current state
         logger.info("Attempting to save current state...")
@@ -960,9 +1102,11 @@ def safe_train(
             
             logger.info(f"Emergency checkpoint saved to: {emergency_dir}")
             logger.info("You can resume training from this checkpoint.")
+            sys.stdout.flush()
             
         except Exception as save_error:
             logger.error(f"Failed to save emergency checkpoint: {save_error}")
+            sys.stdout.flush()
         
         logger.error("=" * 70)
         logger.error("RECOMMENDATIONS:")
@@ -972,12 +1116,14 @@ def safe_train(
         logger.error("4. Close other GPU-using applications")
         logger.error("5. Check for memory leaks in custom code")
         logger.error("=" * 70)
+        sys.stdout.flush()
         
         return False
     
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user")
         logger.info("Saving current state...")
+        sys.stdout.flush()
         
         try:
             interrupt_dir = output_dir / "interrupted_checkpoint"
@@ -987,8 +1133,22 @@ def safe_train(
             logger.info(f"Interrupted checkpoint saved to: {interrupt_dir}")
         except Exception as e:
             logger.error(f"Failed to save interrupted checkpoint: {e}")
+        sys.stdout.flush()
         
         return False
+    
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger.error("=" * 70)
+        logger.error("UNEXPECTED ERROR DURING TRAINING")
+        logger.error("=" * 70)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        logger.error("=" * 70)
+        sys.stdout.flush()
+        raise
 
 
 # ============================================================================
@@ -1136,7 +1296,7 @@ def main(args):
         weight_decay=0.01,
         warmup_ratio=0.1,
         logging_dir=str(output_dir / "logs"),
-        logging_steps=50,
+        logging_steps=5,  # Show progress every 5 steps (was 50)
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=2,
@@ -1151,6 +1311,8 @@ def main(args):
         gradient_checkpointing=True,  # CRITICAL for 4GB VRAM
         optim="adamw_torch",  # Standard PyTorch AdamW (no bitsandbytes)
         max_grad_norm=1.0,  # Gradient clipping for stability
+        disable_tqdm=False,  # Ensure progress bars are shown
+        dataloader_drop_last=False,
     )
     
     print(f"  Batch size (per device): {BATCH_SIZE} (HARDCODED)")
@@ -1159,12 +1321,16 @@ def main(args):
     print(f"  FP16 Mixed Precision: {training_args.fp16}")
     print(f"  Gradient Checkpointing: {training_args.gradient_checkpointing}")
     print(f"  Optimizer: AdamW (torch)")
+    print(f"  Logging steps: {training_args.logging_steps} (progress visible every {training_args.logging_steps} steps)")
+    sys.stdout.flush()
     
     # -------------------------------------------------------------------------
     # Setup trainer with memory callback
     # -------------------------------------------------------------------------
     print("\n[6/6] Initializing trainer...")
     
+    # Create callbacks for progress visibility and memory management
+    progress_callback = TrainingProgressCallback()
     memory_callback = MemoryCleanupCallback(log_interval=args.vram_log_interval)
     
     trainer = DensityAwareTrainer(
@@ -1173,7 +1339,7 @@ def main(args):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
-        callbacks=[memory_callback],
+        callbacks=[progress_callback, memory_callback],
     )
     
     print_vram_status("Pre-training | ")
