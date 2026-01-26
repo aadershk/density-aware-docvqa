@@ -1,15 +1,29 @@
 """
 Density-Aware LayoutLM Training Script for DocVQA
+==================================================
+Optimized for: NVIDIA GTX 1650 Ti (4GB VRAM) on Windows
 
-Research Contribution: Injects local token density embeddings into LayoutLM
-to improve performance on dense documents (the critical failure mode).
+Philosophy: "Reliability over Speed" - No OOM crashes allowed.
 
-Author: Senior Research Engineer
+Features:
+- Gradient Checkpointing (memory-efficient backprop)
+- FP16 Mixed Precision Training
+- Conservative batch settings (batch=1, accum=16)
+- Windows-safe data loading (num_workers=0)
+- Memory cleanup callbacks
+- OOM exception handling with state saving
+- Architecture verification before training
+- VRAM monitoring
+
+Author: Senior ML Systems Engineer
 """
 
 import argparse
+import gc
 import json
+import logging
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +35,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Suppress HuggingFace warnings after first import
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+warnings.filterwarnings("ignore", message="Some weights of")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+
 from datasets import Dataset, load_dataset
 from transformers import (
     LayoutLMTokenizerFast,
@@ -28,23 +48,75 @@ from transformers import (
     LayoutLMConfig,
     Trainer,
     TrainingArguments,
-    EvalPrediction,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
     PreTrainedTokenizerBase,
 )
 from transformers.modeling_outputs import QuestionAnsweringModelOutput
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration
+# Configuration - Windows & Low VRAM Safe Defaults
 # ============================================================================
 
-BASE_DIR = Path(r"C:\Users\Aader\Desktop\Masters\S1 P3\Final Induvidual Assignment")
+BASE_DIR = Path(__file__).parent.resolve()
 DATA_DIR = BASE_DIR / "Data" / "prepared"
 OUTPUT_DIR = BASE_DIR / "outputs" / "density_model"
 
 MODEL_NAME = "microsoft/layoutlm-base-uncased"
 MAX_SEQ_LENGTH = 512
+
+# CRITICAL: Safe defaults for 4GB VRAM
+DEFAULT_BATCH_SIZE = 1
+DEFAULT_GRADIENT_ACCUMULATION = 16
+DEFAULT_LEARNING_RATE = 5e-5
+DEFAULT_EPOCHS = 3
+
+# Windows-safe data loading
+DATALOADER_NUM_WORKERS = 0  # Windows multiprocessing is unstable
+DATALOADER_PIN_MEMORY = True
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def get_vram_usage() -> Tuple[float, float]:
+    """Get current and max VRAM usage in MB."""
+    if torch.cuda.is_available():
+        current = torch.cuda.memory_allocated() / 1024 / 1024
+        max_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024
+        return current, max_allocated
+    return 0.0, 0.0
+
+
+def clear_memory():
+    """Aggressive memory cleanup."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def print_vram_status(prefix: str = ""):
+    """Print current VRAM status."""
+    current, max_used = get_vram_usage()
+    logger.info(f"{prefix}VRAM: {current:.1f}MB (Peak: {max_used:.1f}MB)")
+
+
+def safe_makedirs(path: Path):
+    """Safely create directories (Windows-compatible)."""
+    path = Path(path).resolve()
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # ============================================================================
@@ -61,7 +133,6 @@ def normalized_levenshtein_distance(s1: str, s2: str) -> float:
     if len(s1) == 0 or len(s2) == 0:
         return 1.0
     
-    # Create distance matrix
     m, n = len(s1), len(s2)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     
@@ -74,9 +145,9 @@ def normalized_levenshtein_distance(s1: str, s2: str) -> float:
         for j in range(1, n + 1):
             cost = 0 if s1[i - 1] == s2[j - 1] else 1
             dp[i][j] = min(
-                dp[i - 1][j] + 1,      # deletion
-                dp[i][j - 1] + 1,      # insertion
-                dp[i - 1][j - 1] + cost  # substitution
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
             )
     
     return dp[m][n] / max(m, n)
@@ -85,18 +156,14 @@ def normalized_levenshtein_distance(s1: str, s2: str) -> float:
 def anls_score(prediction: str, ground_truths: List[str], threshold: float = 0.5) -> float:
     """
     Compute ANLS (Average Normalized Levenshtein Similarity) score.
-    
     ANLS = 1 - NL if NL < threshold else 0
-    where NL is normalized Levenshtein distance.
-    
-    Takes max over all ground truth answers.
     """
     if not ground_truths:
         return 0.0
     
     prediction = prediction.lower().strip()
-    
     max_score = 0.0
+    
     for gt in ground_truths:
         gt = gt.lower().strip()
         nl_dist = normalized_levenshtein_distance(prediction, gt)
@@ -126,6 +193,10 @@ class DensityAwareLayoutLM(LayoutLMForQuestionAnswering):
     The Innovation: Adds local token density information as an additional
     embedding that gets added to the standard token embeddings before
     the transformer encoder.
+    
+    Memory Optimizations:
+    - Supports gradient checkpointing
+    - Efficient attention mask handling
     """
     
     def __init__(self, config: LayoutLMConfig):
@@ -152,7 +223,7 @@ class DensityAwareLayoutLM(LayoutLMForQuestionAnswering):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        density_scores: Optional[torch.FloatTensor] = None,  # NEW: (batch, seq_len)
+        density_scores: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, QuestionAnsweringModelOutput]:
         """
         Forward pass with optional density score injection.
@@ -194,20 +265,16 @@ class DensityAwareLayoutLM(LayoutLMForQuestionAnswering):
         
         # Inject density embeddings if provided
         if density_scores is not None:
-            # Ensure density_scores is on the same device and dtype
             density_scores = density_scores.to(inputs_embeds.device, dtype=inputs_embeds.dtype)
-            # Shape: (batch, seq_len, 1) -> (batch, seq_len, hidden_size)
             density_embeds = self.density_projection(density_scores.unsqueeze(-1))
             inputs_embeds = inputs_embeds + density_embeds
         
         # Create extended attention mask (2D -> 4D)
-        # Shape: (batch_size, 1, 1, seq_length)
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = extended_attention_mask.to(dtype=inputs_embeds.dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(inputs_embeds.dtype).min
         
-        # Prepare head mask if needed
-        # Use layoutlm's get_head_mask method
+        # Prepare head mask
         if head_mask is not None:
             head_mask = self.layoutlm.get_head_mask(head_mask, self.config.num_hidden_layers)
         else:
@@ -233,7 +300,6 @@ class DensityAwareLayoutLM(LayoutLMForQuestionAnswering):
         
         total_loss = None
         if start_positions is not None and end_positions is not None:
-            # Clamp positions to valid range
             ignored_index = start_logits.size(1)
             start_positions = start_positions.clamp(0, ignored_index)
             end_positions = end_positions.clamp(0, ignored_index)
@@ -264,20 +330,13 @@ class DensityAwareLayoutLM(LayoutLMForQuestionAnswering):
 class DocVQADataCollator:
     """
     Custom data collator for DocVQA with density scores.
-    
-    Handles:
-    - Tokenization with subword alignment
-    - Density score propagation to subtokens
-    - Answer span finding
-    - Padding/truncation
+    Optimized for memory efficiency on low-VRAM systems.
     """
     tokenizer: PreTrainedTokenizerBase
     max_length: int = MAX_SEQ_LENGTH
-    pad_to_multiple_of: Optional[int] = 8
     
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        batch = self._process_batch(features)
-        return batch
+        return self._process_batch(features)
     
     def _process_batch(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Process a batch of examples."""
@@ -289,7 +348,7 @@ class DocVQADataCollator:
         batch_density_scores = []
         batch_start_positions = []
         batch_end_positions = []
-        batch_metadata = []  # For evaluation
+        batch_metadata = []
         
         for feature in features:
             processed = self._process_single(feature)
@@ -302,7 +361,6 @@ class DocVQADataCollator:
             batch_end_positions.append(processed['end_position'])
             batch_metadata.append(processed['metadata'])
         
-        # Stack tensors
         return {
             'input_ids': torch.stack(batch_input_ids),
             'attention_mask': torch.stack(batch_attention_mask),
@@ -330,13 +388,12 @@ class DocVQADataCollator:
             boxes = [[0, 0, 0, 0]]
             density_scores = [0.0]
         
-        # Ensure we have density scores for all words
+        # Ensure alignment
         if len(density_scores) < len(words):
             density_scores = list(density_scores) + [0.0] * (len(words) - len(density_scores))
         elif len(density_scores) > len(words):
             density_scores = list(density_scores)[:len(words)]
         
-        # Ensure boxes match words
         if len(boxes) < len(words):
             boxes = list(boxes) + [[0, 0, 0, 0]] * (len(words) - len(boxes))
         elif len(boxes) > len(words):
@@ -351,12 +408,12 @@ class DocVQADataCollator:
         )
         question_tokens = question_encoding['input_ids']
         
-        # Limit question length to leave room for context
+        # Limit question length
         max_question_length = 64
         if len(question_tokens) > max_question_length:
             question_tokens = question_tokens[:max_question_length]
         
-        # Tokenize each word and track subword mapping
+        # Tokenize words and expand features to subtokens
         word_tokens = []
         word_boxes_expanded = []
         word_density_expanded = []
@@ -376,55 +433,44 @@ class DocVQADataCollator:
             if len(subtokens) == 0:
                 continue
             
-            # Ensure box is valid
             if not isinstance(box, (list, tuple)) or len(box) != 4:
                 box = [0, 0, 0, 0]
             
             word_tokens.extend(subtokens)
-            # Propagate box and density to all subtokens
             word_boxes_expanded.extend([list(box)] * len(subtokens))
             word_density_expanded.extend([float(density)] * len(subtokens))
         
-        # Handle case where no valid tokens were produced
+        # Handle empty case
         if not word_tokens:
             word_tokens = [self.tokenizer.unk_token_id]
             word_boxes_expanded = [[0, 0, 0, 0]]
             word_density_expanded = [0.0]
         
-        # Calculate available space for context (after [CLS], question, [SEP], [SEP])
-        # Format: [CLS] question [SEP] context [SEP]
+        # Calculate available context space
         special_tokens_count = 3  # [CLS], [SEP], [SEP]
         max_context_length = self.max_length - len(question_tokens) - special_tokens_count
-        max_context_length = max(1, max_context_length)  # Ensure at least 1 token
+        max_context_length = max(1, max_context_length)
         
-        # Truncate context if needed
+        # Truncate context
         if len(word_tokens) > max_context_length:
             word_tokens = word_tokens[:max_context_length]
             word_boxes_expanded = word_boxes_expanded[:max_context_length]
             word_density_expanded = word_density_expanded[:max_context_length]
         
-        # Build final sequence
-        # [CLS] question [SEP] context [SEP]
+        # Build final sequence: [CLS] question [SEP] context [SEP]
         cls_token = self.tokenizer.cls_token_id
         sep_token = self.tokenizer.sep_token_id
         pad_token = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         
         input_ids = [cls_token] + question_tokens + [sep_token] + word_tokens + [sep_token]
-        
-        # Token type IDs: 0 for question, 1 for context
         token_type_ids = [0] * (len(question_tokens) + 2) + [1] * (len(word_tokens) + 1)
         
-        # Bounding boxes: [0,0,0,0] for special tokens and question
         null_box = [0, 0, 0, 0]
         bbox = [null_box] * (len(question_tokens) + 2) + word_boxes_expanded + [null_box]
-        
-        # Density scores: 0 for special tokens and question
         density_seq = [0.0] * (len(question_tokens) + 2) + word_density_expanded + [0.0]
-        
-        # Attention mask
         attention_mask = [1] * len(input_ids)
         
-        # Ensure we don't exceed max_length (safety check)
+        # Safety truncation
         if len(input_ids) > self.max_length:
             input_ids = input_ids[:self.max_length]
             attention_mask = attention_mask[:self.max_length]
@@ -441,11 +487,9 @@ class DocVQADataCollator:
             bbox += [null_box] * padding_length
             density_seq += [0.0] * padding_length
         
-        # Find answer span in the tokenized context
+        # Find answer span
         context_start = len(question_tokens) + 2
-        start_position, end_position = self._find_answer_span(
-            input_ids, answers, context_start
-        )
+        start_position, end_position = self._find_answer_span(input_ids, answers, context_start)
         
         return {
             'input_ids': torch.tensor(input_ids, dtype=torch.long),
@@ -473,7 +517,6 @@ class DocVQADataCollator:
         if not answers:
             return 0, 0
         
-        # Try to find each answer
         for answer in answers:
             answer_encoding = self.tokenizer(
                 answer,
@@ -486,26 +529,17 @@ class DocVQADataCollator:
             if len(answer_tokens) == 0:
                 continue
             
-            # Search for answer tokens in context portion
             for i in range(context_start, len(input_ids) - len(answer_tokens) + 1):
                 if input_ids[i:i + len(answer_tokens)] == answer_tokens:
                     return i, i + len(answer_tokens) - 1
         
-        # Answer not found - return invalid position (will be ignored in loss)
         return 0, 0
 
 
-def preprocess_dataset(
-    dataset: Dataset,
-    tokenizer: LayoutLMTokenizerFast,
-) -> Dataset:
-    """
-    Preprocess dataset for training.
-    We don't do heavy preprocessing here since the collator handles tokenization.
-    """
+def preprocess_dataset(dataset: Dataset, tokenizer: LayoutLMTokenizerFast) -> Dataset:
+    """Preprocess dataset with progress bar."""
     
     def _validate_example(example):
-        """Ensure example has required fields."""
         return {
             'question': example.get('question', ''),
             'words': example.get('words', []),
@@ -520,6 +554,72 @@ def preprocess_dataset(
 
 
 # ============================================================================
+# Memory Cleanup Callback
+# ============================================================================
+
+class MemoryCleanupCallback(TrainerCallback):
+    """
+    Callback to aggressively clean up memory after each epoch and evaluation.
+    Critical for preventing OOM on 4GB VRAM.
+    """
+    
+    def __init__(self, log_interval: int = 100):
+        self.log_interval = log_interval
+        self.step_count = 0
+    
+    def on_step_end(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        self.step_count += 1
+        
+        # Log VRAM every N steps
+        if self.step_count % self.log_interval == 0:
+            current, max_used = get_vram_usage()
+            logger.info(f"Step {state.global_step} | VRAM: {current:.1f}MB / Peak: {max_used:.1f}MB")
+        
+        return control
+    
+    def on_epoch_end(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        logger.info("Epoch complete - Running memory cleanup...")
+        clear_memory()
+        print_vram_status("Post-epoch cleanup | ")
+        return control
+    
+    def on_evaluate(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        logger.info("Evaluation complete - Running memory cleanup...")
+        clear_memory()
+        print_vram_status("Post-eval cleanup | ")
+        return control
+    
+    def on_save(
+        self, 
+        args: TrainingArguments, 
+        state: TrainerState, 
+        control: TrainerControl, 
+        **kwargs
+    ):
+        logger.info("Checkpoint saved - Running memory cleanup...")
+        clear_memory()
+        return control
+
+
+# ============================================================================
 # Custom Trainer with Density Scores
 # ============================================================================
 
@@ -530,11 +630,10 @@ class DensityAwareTrainer(Trainer):
         """Override to pass density_scores to model."""
         
         # Extract metadata (not used in forward pass)
-        metadata = inputs.pop('metadata', None)
+        inputs.pop('metadata', None)
         
         # Forward pass with density scores
         outputs = model(**inputs)
-        
         loss = outputs.loss
         
         return (loss, outputs) if return_outputs else loss
@@ -548,10 +647,7 @@ class DensityAwareTrainer(Trainer):
     ):
         """Override to handle metadata and density scores."""
         
-        # Store metadata before moving to device
-        metadata = inputs.pop('metadata', None)
-        
-        # Move inputs to device
+        inputs.pop('metadata', None)
         inputs = self._prepare_inputs(inputs)
         
         with torch.no_grad():
@@ -561,17 +657,93 @@ class DensityAwareTrainer(Trainer):
         if prediction_loss_only:
             return (loss, None, None)
         
-        # Return predictions
         start_logits = outputs.start_logits
         end_logits = outputs.end_logits
-        
-        # Stack logits for return
         logits = (start_logits, end_logits)
-        
-        # Labels
         labels = (inputs.get('start_positions'), inputs.get('end_positions'))
         
         return (loss, logits, labels)
+
+
+# ============================================================================
+# Architecture Verification
+# ============================================================================
+
+def verify_architecture(
+    model: DensityAwareLayoutLM,
+    tokenizer: LayoutLMTokenizerFast,
+    device: torch.device
+) -> bool:
+    """
+    Verify the custom density projection layer is working correctly.
+    Passes a single dummy batch through the model.
+    """
+    logger.info("Running architecture verification...")
+    
+    try:
+        model.eval()
+        
+        # Create dummy batch
+        batch_size = 1
+        seq_length = 128
+        
+        dummy_input_ids = torch.randint(0, tokenizer.vocab_size, (batch_size, seq_length), device=device)
+        dummy_attention_mask = torch.ones(batch_size, seq_length, dtype=torch.long, device=device)
+        dummy_token_type_ids = torch.zeros(batch_size, seq_length, dtype=torch.long, device=device)
+        dummy_bbox = torch.zeros(batch_size, seq_length, 4, dtype=torch.long, device=device)
+        dummy_density_scores = torch.rand(batch_size, seq_length, device=device)
+        
+        # Forward pass
+        with torch.no_grad():
+            outputs = model(
+                input_ids=dummy_input_ids,
+                attention_mask=dummy_attention_mask,
+                token_type_ids=dummy_token_type_ids,
+                bbox=dummy_bbox,
+                density_scores=dummy_density_scores,
+            )
+        
+        # Verify outputs
+        assert outputs.start_logits is not None, "start_logits is None"
+        assert outputs.end_logits is not None, "end_logits is None"
+        assert outputs.start_logits.shape == (batch_size, seq_length), f"Unexpected start_logits shape: {outputs.start_logits.shape}"
+        assert outputs.end_logits.shape == (batch_size, seq_length), f"Unexpected end_logits shape: {outputs.end_logits.shape}"
+        
+        # Verify density projection is being used
+        assert hasattr(model, 'density_projection'), "density_projection layer missing"
+        assert model.density_projection.weight.shape == (model.config.hidden_size, 1), "density_projection has wrong shape"
+        
+        # Test without density scores (fallback behavior)
+        with torch.no_grad():
+            outputs_no_density = model(
+                input_ids=dummy_input_ids,
+                attention_mask=dummy_attention_mask,
+                token_type_ids=dummy_token_type_ids,
+                bbox=dummy_bbox,
+                density_scores=None,
+            )
+        
+        assert outputs_no_density.start_logits is not None, "Fallback mode failed"
+        
+        # Clean up
+        del dummy_input_ids, dummy_attention_mask, dummy_token_type_ids, dummy_bbox, dummy_density_scores
+        del outputs, outputs_no_density
+        clear_memory()
+        
+        logger.info("=" * 50)
+        logger.info("ARCHITECTURE VERIFICATION PASSED")
+        logger.info("- Density projection layer: OK")
+        logger.info("- Forward pass with density: OK")
+        logger.info("- Forward pass without density (fallback): OK")
+        logger.info("- Output shapes: OK")
+        logger.info("=" * 50)
+        
+        model.train()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Architecture verification FAILED: {e}")
+        return False
 
 
 # ============================================================================
@@ -593,13 +765,11 @@ def decode_predictions(
         start_idx = start_logits[i].argmax().item()
         end_idx = end_logits[i].argmax().item()
         
-        # Ensure valid span
         if end_idx < start_idx:
             end_idx = start_idx
         if end_idx - start_idx > max_answer_length:
             end_idx = start_idx + max_answer_length
         
-        # Decode
         tokens = input_ids[i, start_idx:end_idx + 1].tolist()
         prediction = tokenizer.decode(tokens, skip_special_tokens=True)
         predictions.append(prediction.strip())
@@ -615,13 +785,11 @@ def evaluate_stratified(
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluate model with stratified metrics by density group.
-    
-    Returns dict with metrics for each density group and overall.
+    Memory-efficient implementation with periodic cleanup.
     """
     
     model.eval()
     
-    # Collect predictions and ground truths by group
     results_by_group = {
         'Sparse': {'predictions': [], 'ground_truths': []},
         'Medium': {'predictions': [], 'ground_truths': []},
@@ -629,23 +797,19 @@ def evaluate_stratified(
         'Overall': {'predictions': [], 'ground_truths': []},
     }
     
+    eval_progress = tqdm(eval_dataloader, desc="Stratified Evaluation", leave=False)
+    
     with torch.no_grad():
-        for batch in tqdm(eval_dataloader, desc="Evaluating"):
-            # Extract metadata (not a tensor)
+        for batch_idx, batch in enumerate(eval_progress):
             metadata = batch.pop('metadata')
-            
-            # Remove positions for inference
             batch.pop('start_positions', None)
             batch.pop('end_positions', None)
             
-            # Move tensors to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                      for k, v in batch.items()}
             
-            # Forward pass
             outputs = model(**batch)
             
-            # Decode predictions
             preds = decode_predictions(
                 outputs.start_logits.cpu(),
                 outputs.end_logits.cpu(),
@@ -653,7 +817,6 @@ def evaluate_stratified(
                 tokenizer
             )
             
-            # Collect results
             for pred, meta in zip(preds, metadata):
                 group = meta['density_group']
                 ground_truths = meta['answers']
@@ -665,11 +828,11 @@ def evaluate_stratified(
                 results_by_group['Overall']['predictions'].append(pred)
                 results_by_group['Overall']['ground_truths'].append(ground_truths)
             
-            # Clear GPU cache periodically
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Periodic memory cleanup
+            if batch_idx % 50 == 0:
+                clear_memory()
     
-    # Compute metrics for each group
+    # Compute metrics
     metrics = {}
     
     for group, data in results_by_group.items():
@@ -690,6 +853,7 @@ def evaluate_stratified(
             'count': len(data['predictions']),
         }
     
+    clear_memory()
     return metrics
 
 
@@ -712,20 +876,94 @@ def print_stratified_results(metrics: Dict[str, Dict[str, float]]):
     
     print("=" * 70)
     
-    # Calculate performance gap
     if 'Sparse' in metrics and 'Dense' in metrics:
         sparse_anls = metrics['Sparse']['anls']
         dense_anls = metrics['Dense']['anls']
         gap = sparse_anls - dense_anls
         print(f"\nPerformance Gap (Sparse - Dense): {gap:+.2f}% ANLS")
         if gap > 5:
-            print("-> Significant gap detected: Model struggles on dense documents")
+            print("-> Significant gap: Model struggles on dense documents")
         elif gap < -5:
             print("-> Dense documents perform better (unexpected)")
         else:
-            print("-> Relatively balanced performance across density groups")
+            print("-> Balanced performance across density groups")
     
     print()
+
+
+# ============================================================================
+# Safe Training with OOM Handling
+# ============================================================================
+
+def safe_train(
+    trainer: DensityAwareTrainer,
+    output_dir: Path,
+    model: DensityAwareLayoutLM,
+    tokenizer: LayoutLMTokenizerFast,
+) -> bool:
+    """
+    Wrapper around trainer.train() with OOM exception handling.
+    Attempts to save state before exiting on OOM.
+    """
+    
+    try:
+        logger.info("Starting training...")
+        print_vram_status("Pre-training | ")
+        
+        trainer.train()
+        
+        logger.info("Training completed successfully!")
+        return True
+        
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            logger.error("=" * 70)
+            logger.error("OUT OF MEMORY ERROR DETECTED")
+            logger.error("=" * 70)
+            logger.error(f"Error: {e}")
+            
+            # Attempt to save current state
+            logger.info("Attempting to save current state...")
+            try:
+                clear_memory()
+                emergency_dir = output_dir / "emergency_checkpoint"
+                safe_makedirs(emergency_dir)
+                
+                model.save_pretrained(emergency_dir)
+                tokenizer.save_pretrained(emergency_dir)
+                
+                logger.info(f"Emergency checkpoint saved to: {emergency_dir}")
+                logger.info("You can resume training from this checkpoint.")
+                
+            except Exception as save_error:
+                logger.error(f"Failed to save emergency checkpoint: {save_error}")
+            
+            logger.error("=" * 70)
+            logger.error("RECOMMENDATIONS:")
+            logger.error("1. Reduce batch_size (currently using the minimum of 1)")
+            logger.error("2. Reduce max_seq_length from 512 to 384 or 256")
+            logger.error("3. Enable more aggressive gradient checkpointing")
+            logger.error("4. Close other GPU-using applications")
+            logger.error("=" * 70)
+            
+            return False
+        else:
+            raise  # Re-raise non-OOM errors
+    
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user")
+        logger.info("Saving current state...")
+        
+        try:
+            interrupt_dir = output_dir / "interrupted_checkpoint"
+            safe_makedirs(interrupt_dir)
+            model.save_pretrained(interrupt_dir)
+            tokenizer.save_pretrained(interrupt_dir)
+            logger.info(f"Interrupted checkpoint saved to: {interrupt_dir}")
+        except Exception as e:
+            logger.error(f"Failed to save interrupted checkpoint: {e}")
+        
+        return False
 
 
 # ============================================================================
@@ -737,40 +975,78 @@ def main(args):
     
     print("=" * 70)
     print("DENSITY-AWARE LAYOUTLM TRAINING")
+    print("Optimized for: NVIDIA GTX 1650 Ti (4GB VRAM) on Windows")
+    print("Philosophy: Reliability over Speed")
     print("=" * 70)
     
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
+    
     if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024 / 1024 / 1024
+        print(f"GPU: {gpu_name} ({gpu_mem:.1f}GB)")
+        print_vram_status("Initial | ")
+        
+        # Reset peak memory stats
+        torch.cuda.reset_peak_memory_stats()
+    else:
+        logger.warning("CUDA not available - training will be slow on CPU!")
     
     # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = safe_makedirs(Path(args.output_dir))
+    logger.info(f"Output directory: {output_dir}")
     
     # -------------------------------------------------------------------------
     # Load tokenizer and model
     # -------------------------------------------------------------------------
-    print("\n[1/5] Loading model and tokenizer...")
+    print("\n[1/6] Loading model and tokenizer...")
     
     tokenizer = LayoutLMTokenizerFast.from_pretrained(MODEL_NAME)
     
     config = LayoutLMConfig.from_pretrained(MODEL_NAME)
-    model = DensityAwareLayoutLM.from_pretrained(MODEL_NAME, config=config)
+    
+    # Suppress model loading warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = DensityAwareLayoutLM.from_pretrained(MODEL_NAME, config=config)
+    
+    # Enable gradient checkpointing (CRITICAL for 4GB VRAM)
+    model.gradient_checkpointing_enable()
+    logger.info("Gradient checkpointing: ENABLED")
+    
     model.to(device)
     
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
     print(f"  Model: {MODEL_NAME}")
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"  Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    print(f"  Parameters: {total_params:,}")
+    print(f"  Trainable: {trainable_params:,}")
+    print_vram_status("After model load | ")
+    
+    # -------------------------------------------------------------------------
+    # Architecture Verification
+    # -------------------------------------------------------------------------
+    print("\n[2/6] Verifying architecture...")
+    
+    if not verify_architecture(model, tokenizer, device):
+        logger.error("Architecture verification failed! Aborting.")
+        sys.exit(1)
     
     # -------------------------------------------------------------------------
     # Load datasets
     # -------------------------------------------------------------------------
-    print("\n[2/5] Loading datasets...")
+    print("\n[3/6] Loading datasets...")
     
     train_file = DATA_DIR / "train_v1.0_prepared.jsonl"
     val_file = DATA_DIR / "val_v1.0_prepared.jsonl"
+    
+    if not train_file.exists():
+        logger.error(f"Training file not found: {train_file}")
+        logger.error("Please run stratified_data_setup.py first!")
+        sys.exit(1)
     
     dataset = load_dataset(
         'json',
@@ -783,67 +1059,75 @@ def main(args):
     print(f"  Train: {len(dataset['train'])} samples")
     print(f"  Validation: {len(dataset['validation'])} samples")
     
-    # Preprocess
+    # Preprocess with progress bar
     train_dataset = preprocess_dataset(dataset['train'], tokenizer)
     val_dataset = preprocess_dataset(dataset['validation'], tokenizer)
     
+    clear_memory()
+    
     # -------------------------------------------------------------------------
-    # Setup data collator
+    # Setup data pipeline
     # -------------------------------------------------------------------------
-    print("\n[3/5] Setting up data pipeline...")
+    print("\n[4/6] Setting up data pipeline...")
     
     data_collator = DocVQADataCollator(
         tokenizer=tokenizer,
         max_length=MAX_SEQ_LENGTH,
     )
     
-    # -------------------------------------------------------------------------
-    # Training arguments
-    # -------------------------------------------------------------------------
-    print("\n[4/5] Configuring training...")
+    print(f"  Max sequence length: {MAX_SEQ_LENGTH}")
+    print(f"  Data workers: {DATALOADER_NUM_WORKERS} (Windows-safe)")
+    print(f"  Pin memory: {DATALOADER_PIN_MEMORY}")
     
-    # Calculate gradient accumulation steps for effective batch size
-    effective_batch_size = 16
-    gradient_accumulation_steps = max(1, effective_batch_size // args.batch_size)
+    # -------------------------------------------------------------------------
+    # Training arguments - SAFE DEFAULTS
+    # -------------------------------------------------------------------------
+    print("\n[5/6] Configuring training...")
+    
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
     
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         weight_decay=0.01,
         warmup_ratio=0.1,
         logging_dir=str(output_dir / "logs"),
-        logging_steps=100,
+        logging_steps=50,
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        fp16=torch.cuda.is_available(),
-        dataloader_num_workers=args.num_workers,
+        fp16=torch.cuda.is_available(),  # Mixed precision
+        dataloader_num_workers=DATALOADER_NUM_WORKERS,
+        dataloader_pin_memory=DATALOADER_PIN_MEMORY,
         report_to="none",
-        remove_unused_columns=False,  # Keep all columns for custom collator
-        gradient_checkpointing=args.gradient_checkpointing,
-        optim="adamw_torch",
-        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+        gradient_checkpointing=True,
+        optim="adamw_torch",  # Standard PyTorch AdamW (no bitsandbytes)
+        max_grad_norm=1.0,  # Gradient clipping for stability
     )
     
     print(f"  Epochs: {args.epochs}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Gradient accumulation: {gradient_accumulation_steps}")
-    print(f"  Effective batch size: {args.batch_size * gradient_accumulation_steps}")
+    print(f"  Batch size (per device): {args.batch_size}")
+    print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"  Effective batch size: {effective_batch_size}")
     print(f"  Learning rate: {args.learning_rate}")
-    print(f"  FP16: {training_args.fp16}")
-    print(f"  Gradient checkpointing: {args.gradient_checkpointing}")
+    print(f"  FP16 Mixed Precision: {training_args.fp16}")
+    print(f"  Gradient Checkpointing: {training_args.gradient_checkpointing}")
+    print(f"  Optimizer: AdamW (torch)")
     
     # -------------------------------------------------------------------------
-    # Train
+    # Setup trainer with memory callback
     # -------------------------------------------------------------------------
-    print("\n[5/5] Training...")
+    print("\n[6/6] Initializing trainer...")
+    
+    memory_callback = MemoryCleanupCallback(log_interval=args.vram_log_interval)
     
     trainer = DensityAwareTrainer(
         model=model,
@@ -851,15 +1135,32 @@ def main(args):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
+        callbacks=[memory_callback],
     )
     
+    print_vram_status("Pre-training | ")
+    
+    # -------------------------------------------------------------------------
+    # Train with OOM handling
+    # -------------------------------------------------------------------------
     if not args.eval_only:
-        trainer.train()
+        print("\n" + "=" * 70)
+        print("STARTING TRAINING")
+        print("=" * 70)
         
-        # Save final model
-        model.save_pretrained(output_dir / "final_model")
-        tokenizer.save_pretrained(output_dir / "final_model")
-        print(f"\nModel saved to {output_dir / 'final_model'}")
+        training_success = safe_train(trainer, output_dir, model, tokenizer)
+        
+        if training_success:
+            # Save final model
+            final_model_dir = output_dir / "final_model"
+            safe_makedirs(final_model_dir)
+            model.save_pretrained(final_model_dir)
+            tokenizer.save_pretrained(final_model_dir)
+            logger.info(f"Final model saved to: {final_model_dir}")
+        else:
+            logger.error("Training did not complete successfully")
+            if not args.eval_anyway:
+                return None
     
     # -------------------------------------------------------------------------
     # Stratified Evaluation
@@ -868,13 +1169,16 @@ def main(args):
     print("RUNNING STRATIFIED EVALUATION")
     print("=" * 70)
     
-    # Create eval dataloader
+    clear_memory()
+    print_vram_status("Pre-evaluation | ")
+    
     eval_dataloader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=data_collator,
-        num_workers=args.num_workers,
+        num_workers=DATALOADER_NUM_WORKERS,
+        pin_memory=DATALOADER_PIN_MEMORY,
     )
     
     metrics = evaluate_stratified(model, eval_dataloader, tokenizer, device)
@@ -884,7 +1188,21 @@ def main(args):
     metrics_file = output_dir / "stratified_metrics.json"
     with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=2)
-    print(f"Metrics saved to {metrics_file}")
+    logger.info(f"Metrics saved to: {metrics_file}")
+    
+    # Final memory report
+    print("\n" + "=" * 70)
+    print("FINAL MEMORY REPORT")
+    print("=" * 70)
+    current, peak = get_vram_usage()
+    print(f"Current VRAM: {current:.1f}MB")
+    print(f"Peak VRAM: {peak:.1f}MB")
+    if torch.cuda.is_available():
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1024 / 1024
+        print(f"Total VRAM: {total_vram:.1f}MB")
+        print(f"Peak Usage: {peak / total_vram * 100:.1f}%")
+    
+    print("\nTraining pipeline completed successfully!")
     
     return metrics
 
@@ -894,31 +1212,40 @@ def main(args):
 # ============================================================================
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command line arguments with SAFE defaults for 4GB VRAM."""
     
     parser = argparse.ArgumentParser(
-        description="Train Density-Aware LayoutLM for DocVQA"
+        description="Train Density-Aware LayoutLM for DocVQA (Optimized for 4GB VRAM)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Training hyperparameters - SAFE DEFAULTS
     parser.add_argument(
         "--batch_size", "-b",
         type=int,
-        default=4,
-        help="Batch size for training and evaluation (default: 4)"
+        default=DEFAULT_BATCH_SIZE,
+        help="Batch size per device (keep at 1 for 4GB VRAM)"
+    )
+    
+    parser.add_argument(
+        "--gradient_accumulation_steps", "-ga",
+        type=int,
+        default=DEFAULT_GRADIENT_ACCUMULATION,
+        help="Gradient accumulation steps (simulates larger batch)"
     )
     
     parser.add_argument(
         "--learning_rate", "-lr",
         type=float,
-        default=5e-5,
-        help="Learning rate (default: 5e-5)"
+        default=DEFAULT_LEARNING_RATE,
+        help="Learning rate"
     )
     
     parser.add_argument(
         "--epochs", "-e",
         type=int,
-        default=3,
-        help="Number of training epochs (default: 3)"
+        default=DEFAULT_EPOCHS,
+        help="Number of training epochs"
     )
     
     parser.add_argument(
@@ -928,13 +1255,7 @@ def parse_args():
         help="Output directory for model and logs"
     )
     
-    parser.add_argument(
-        "--num_workers", "-w",
-        type=int,
-        default=0,
-        help="Number of dataloader workers (default: 0)"
-    )
-    
+    # Evaluation options
     parser.add_argument(
         "--eval_only",
         action="store_true",
@@ -942,9 +1263,17 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--gradient_checkpointing",
+        "--eval_anyway",
         action="store_true",
-        help="Enable gradient checkpointing to reduce memory usage"
+        help="Run evaluation even if training fails"
+    )
+    
+    # Monitoring
+    parser.add_argument(
+        "--vram_log_interval",
+        type=int,
+        default=100,
+        help="Log VRAM usage every N steps"
     )
     
     return parser.parse_args()
@@ -952,4 +1281,17 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Print configuration summary
+    print("\n" + "=" * 70)
+    print("CONFIGURATION SUMMARY")
+    print("=" * 70)
+    print(f"Batch size: {args.batch_size}")
+    print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning rate: {args.learning_rate}")
+    print(f"Output: {args.output_dir}")
+    print("=" * 70)
+    
     main(args)
