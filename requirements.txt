@@ -1,0 +1,23 @@
+# Density-Aware DocVQA Training Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core ML Framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Transformers & Datasets
+transformers>=4.30.0
+datasets>=2.14.0
+tokenizers>=0.13.0
+
+# Data Processing (already installed from EDA)
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# Visualization (for analysis)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Optional: Weights & Biases for experiment tracking
+# wandb>=0.15.0
