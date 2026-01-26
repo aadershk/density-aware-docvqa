@@ -3,17 +3,14 @@ Density-Aware LayoutLM Training Script for DocVQA
 ==================================================
 Optimized for: NVIDIA GTX 1650 Ti (4GB VRAM) on Windows
 
-Philosophy: "Reliability over Speed" - No OOM crashes allowed.
+Philosophy: "Reliability over Speed" - Zero OOM crashes allowed.
 
-Features:
-- Gradient Checkpointing (memory-efficient backprop)
-- FP16 Mixed Precision Training
-- Conservative batch settings (batch=1, accum=16)
-- Windows-safe data loading (num_workers=0)
-- Memory cleanup callbacks
-- OOM exception handling with state saving
-- Architecture verification before training
-- VRAM monitoring
+4GB VRAM Survival Guide:
+- Batch Size: HARDCODED to 1 (cannot be changed)
+- Gradient Accumulation: HARDCODED to 16 (effective batch = 16)
+- Gradient Checkpointing: ENABLED (trades compute for memory)
+- FP16 Mixed Precision: ENABLED
+- Windows Safety: num_workers=0 (critical for Windows)
 
 Author: Senior ML Systems Engineer
 """
@@ -35,7 +32,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Suppress HuggingFace warnings after first import
+# Suppress HuggingFace warnings
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 warnings.filterwarnings("ignore", message="Some weights of")
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -64,7 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Configuration - Windows & Low VRAM Safe Defaults
+# Configuration - HARDCODED for 4GB VRAM
 # ============================================================================
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -74,15 +71,18 @@ OUTPUT_DIR = BASE_DIR / "outputs" / "density_model"
 MODEL_NAME = "microsoft/layoutlm-base-uncased"
 MAX_SEQ_LENGTH = 512
 
-# CRITICAL: Safe defaults for 4GB VRAM
-DEFAULT_BATCH_SIZE = 1
-DEFAULT_GRADIENT_ACCUMULATION = 16
+# CRITICAL: HARDCODED values for 4GB VRAM (cannot be changed)
+BATCH_SIZE = 1  # DO NOT CHANGE - Required for 4GB VRAM
+GRADIENT_ACCUMULATION_STEPS = 16  # DO NOT CHANGE - Effective batch = 16
 DEFAULT_LEARNING_RATE = 5e-5
 DEFAULT_EPOCHS = 3
 
-# Windows-safe data loading
+# Windows-safe data loading (CRITICAL)
 DATALOADER_NUM_WORKERS = 0  # Windows multiprocessing is unstable
 DATALOADER_PIN_MEMORY = True
+
+# Effective batch size (for reporting)
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
 
 
 # ============================================================================
@@ -120,12 +120,13 @@ def safe_makedirs(path: Path):
 
 
 # ============================================================================
-# ANLS Metric Implementation
+# ANLS Metric Implementation (Paper-Grade)
 # ============================================================================
 
 def normalized_levenshtein_distance(s1: str, s2: str) -> float:
     """
     Compute normalized Levenshtein distance between two strings.
+    Paper specification: Normalize by max(len(s1), len(s2))
     Returns value in [0, 1] where 0 = identical, 1 = completely different.
     """
     if len(s1) == 0 and len(s2) == 0:
@@ -136,27 +137,42 @@ def normalized_levenshtein_distance(s1: str, s2: str) -> float:
     m, n = len(s1), len(s2)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     
+    # Initialize base cases
     for i in range(m + 1):
         dp[i][0] = i
     for j in range(n + 1):
         dp[0][j] = j
     
+    # Fill DP table
     for i in range(1, m + 1):
         for j in range(1, n + 1):
             cost = 0 if s1[i - 1] == s2[j - 1] else 1
             dp[i][j] = min(
-                dp[i - 1][j] + 1,
-                dp[i][j - 1] + 1,
-                dp[i - 1][j - 1] + cost
+                dp[i - 1][j] + 1,      # deletion
+                dp[i][j - 1] + 1,      # insertion
+                dp[i - 1][j - 1] + cost  # substitution
             )
     
+    # Normalize by max length (paper specification)
     return dp[m][n] / max(m, n)
 
 
 def anls_score(prediction: str, ground_truths: List[str], threshold: float = 0.5) -> float:
     """
     Compute ANLS (Average Normalized Levenshtein Similarity) score.
-    ANLS = 1 - NL if NL < threshold else 0
+    
+    Paper specification:
+    - ANLS = 1 - NL if NL < threshold else 0
+    - NL = normalized Levenshtein distance
+    - Takes max over all ground truth answers
+    
+    Args:
+        prediction: Model prediction string
+        ground_truths: List of valid ground truth answers
+        threshold: ANLS threshold (default 0.5 as per DocVQA paper)
+    
+    Returns:
+        ANLS score in [0, 1]
     """
     if not ground_truths:
         return 0.0
@@ -164,10 +180,17 @@ def anls_score(prediction: str, ground_truths: List[str], threshold: float = 0.5
     prediction = prediction.lower().strip()
     max_score = 0.0
     
+    # Iterate over all ground truths and take max (paper spec)
     for gt in ground_truths:
         gt = gt.lower().strip()
         nl_dist = normalized_levenshtein_distance(prediction, gt)
-        score = 1.0 - nl_dist if nl_dist < threshold else 0.0
+        
+        # ANLS formula: 1 - NL if NL < threshold, else 0
+        if nl_dist < threshold:
+            score = 1.0 - nl_dist
+        else:
+            score = 0.0
+        
         max_score = max(max_score, score)
     
     return max_score
@@ -554,12 +577,13 @@ def preprocess_dataset(dataset: Dataset, tokenizer: LayoutLMTokenizerFast) -> Da
 
 
 # ============================================================================
-# Memory Cleanup Callback
+# Memory Cleanup Callback (Aggressive)
 # ============================================================================
 
 class MemoryCleanupCallback(TrainerCallback):
     """
-    Callback to aggressively clean up memory after each epoch and evaluation.
+    Aggressive memory cleanup callback.
+    Runs gc.collect() and torch.cuda.empty_cache() after every epoch and evaluation.
     Critical for preventing OOM on 4GB VRAM.
     """
     
@@ -590,7 +614,7 @@ class MemoryCleanupCallback(TrainerCallback):
         control: TrainerControl, 
         **kwargs
     ):
-        logger.info("Epoch complete - Running memory cleanup...")
+        logger.info("Epoch complete - Running aggressive memory cleanup...")
         clear_memory()
         print_vram_status("Post-epoch cleanup | ")
         return control
@@ -602,7 +626,7 @@ class MemoryCleanupCallback(TrainerCallback):
         control: TrainerControl, 
         **kwargs
     ):
-        logger.info("Evaluation complete - Running memory cleanup...")
+        logger.info("Evaluation complete - Running aggressive memory cleanup...")
         clear_memory()
         print_vram_status("Post-eval cleanup | ")
         return control
@@ -629,10 +653,7 @@ class DensityAwareTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Override to pass density_scores to model."""
         
-        # Extract metadata (not used in forward pass)
         inputs.pop('metadata', None)
-        
-        # Forward pass with density scores
         outputs = model(**inputs)
         loss = outputs.loss
         
@@ -666,7 +687,7 @@ class DensityAwareTrainer(Trainer):
 
 
 # ============================================================================
-# Architecture Verification
+# Pre-Flight Architecture Verification
 # ============================================================================
 
 def verify_architecture(
@@ -675,15 +696,15 @@ def verify_architecture(
     device: torch.device
 ) -> bool:
     """
-    Verify the custom density projection layer is working correctly.
-    Passes a single dummy batch through the model.
+    Pre-flight check: Verify the custom density projection layer is working correctly.
+    Passes a single dummy batch through the model before training starts.
     """
-    logger.info("Running architecture verification...")
+    logger.info("Running pre-flight architecture verification...")
     
     try:
         model.eval()
         
-        # Create dummy batch
+        # Create dummy batch (single sample)
         batch_size = 1
         seq_length = 128
         
@@ -693,7 +714,7 @@ def verify_architecture(
         dummy_bbox = torch.zeros(batch_size, seq_length, 4, dtype=torch.long, device=device)
         dummy_density_scores = torch.rand(batch_size, seq_length, device=device)
         
-        # Forward pass
+        # Forward pass with density scores
         with torch.no_grad():
             outputs = model(
                 input_ids=dummy_input_ids,
@@ -706,14 +727,17 @@ def verify_architecture(
         # Verify outputs
         assert outputs.start_logits is not None, "start_logits is None"
         assert outputs.end_logits is not None, "end_logits is None"
-        assert outputs.start_logits.shape == (batch_size, seq_length), f"Unexpected start_logits shape: {outputs.start_logits.shape}"
-        assert outputs.end_logits.shape == (batch_size, seq_length), f"Unexpected end_logits shape: {outputs.end_logits.shape}"
+        assert outputs.start_logits.shape == (batch_size, seq_length), \
+            f"Unexpected start_logits shape: {outputs.start_logits.shape}, expected ({batch_size}, {seq_length})"
+        assert outputs.end_logits.shape == (batch_size, seq_length), \
+            f"Unexpected end_logits shape: {outputs.end_logits.shape}, expected ({batch_size}, {seq_length})"
         
-        # Verify density projection is being used
+        # Verify density projection layer exists
         assert hasattr(model, 'density_projection'), "density_projection layer missing"
-        assert model.density_projection.weight.shape == (model.config.hidden_size, 1), "density_projection has wrong shape"
+        assert model.density_projection.weight.shape == (model.config.hidden_size, 1), \
+            f"density_projection has wrong shape: {model.density_projection.weight.shape}"
         
-        # Test without density scores (fallback behavior)
+        # Test fallback behavior (without density scores)
         with torch.no_grad():
             outputs_no_density = model(
                 input_ids=dummy_input_ids,
@@ -730,19 +754,21 @@ def verify_architecture(
         del outputs, outputs_no_density
         clear_memory()
         
-        logger.info("=" * 50)
-        logger.info("ARCHITECTURE VERIFICATION PASSED")
+        logger.info("=" * 70)
+        logger.info("PRE-FLIGHT ARCHITECTURE VERIFICATION PASSED")
         logger.info("- Density projection layer: OK")
         logger.info("- Forward pass with density: OK")
         logger.info("- Forward pass without density (fallback): OK")
         logger.info("- Output shapes: OK")
-        logger.info("=" * 50)
+        logger.info("=" * 70)
         
         model.train()
         return True
         
     except Exception as e:
         logger.error(f"Architecture verification FAILED: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 
@@ -785,7 +811,7 @@ def evaluate_stratified(
 ) -> Dict[str, Dict[str, float]]:
     """
     Evaluate model with stratified metrics by density group.
-    Memory-efficient implementation with periodic cleanup.
+    Uses paper-grade ANLS metric.
     """
     
     model.eval()
@@ -832,7 +858,7 @@ def evaluate_stratified(
             if batch_idx % 50 == 0:
                 clear_memory()
     
-    # Compute metrics
+    # Compute metrics using paper-grade ANLS
     metrics = {}
     
     for group, data in results_by_group.items():
@@ -861,7 +887,7 @@ def print_stratified_results(metrics: Dict[str, Dict[str, float]]):
     """Print stratified evaluation results as a table."""
     
     print("\n" + "=" * 70)
-    print("STRATIFIED EVALUATION RESULTS")
+    print("STRATIFIED EVALUATION RESULTS (Paper-Grade ANLS)")
     print("=" * 70)
     print(f"{'Group':<12} {'Count':>8} {'ANLS':>10} {'Exact Match':>12}")
     print("-" * 70)
@@ -892,7 +918,7 @@ def print_stratified_results(metrics: Dict[str, Dict[str, float]]):
 
 
 # ============================================================================
-# Safe Training with OOM Handling
+# Safe Training with OOM Handling (torch.cuda.OutOfMemoryError)
 # ============================================================================
 
 def safe_train(
@@ -903,6 +929,7 @@ def safe_train(
 ) -> bool:
     """
     Wrapper around trainer.train() with OOM exception handling.
+    Uses torch.cuda.OutOfMemoryError for precise OOM detection.
     Attempts to save state before exiting on OOM.
     """
     
@@ -915,40 +942,38 @@ def safe_train(
         logger.info("Training completed successfully!")
         return True
         
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            logger.error("=" * 70)
-            logger.error("OUT OF MEMORY ERROR DETECTED")
-            logger.error("=" * 70)
-            logger.error(f"Error: {e}")
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error("=" * 70)
+        logger.error("OUT OF MEMORY ERROR DETECTED (torch.cuda.OutOfMemoryError)")
+        logger.error("=" * 70)
+        logger.error(f"Error: {e}")
+        
+        # Attempt to save current state
+        logger.info("Attempting to save current state...")
+        try:
+            clear_memory()
+            emergency_dir = output_dir / "emergency_checkpoint"
+            safe_makedirs(emergency_dir)
             
-            # Attempt to save current state
-            logger.info("Attempting to save current state...")
-            try:
-                clear_memory()
-                emergency_dir = output_dir / "emergency_checkpoint"
-                safe_makedirs(emergency_dir)
-                
-                model.save_pretrained(emergency_dir)
-                tokenizer.save_pretrained(emergency_dir)
-                
-                logger.info(f"Emergency checkpoint saved to: {emergency_dir}")
-                logger.info("You can resume training from this checkpoint.")
-                
-            except Exception as save_error:
-                logger.error(f"Failed to save emergency checkpoint: {save_error}")
+            model.save_pretrained(emergency_dir)
+            tokenizer.save_pretrained(emergency_dir)
             
-            logger.error("=" * 70)
-            logger.error("RECOMMENDATIONS:")
-            logger.error("1. Reduce batch_size (currently using the minimum of 1)")
-            logger.error("2. Reduce max_seq_length from 512 to 384 or 256")
-            logger.error("3. Enable more aggressive gradient checkpointing")
-            logger.error("4. Close other GPU-using applications")
-            logger.error("=" * 70)
+            logger.info(f"Emergency checkpoint saved to: {emergency_dir}")
+            logger.info("You can resume training from this checkpoint.")
             
-            return False
-        else:
-            raise  # Re-raise non-OOM errors
+        except Exception as save_error:
+            logger.error(f"Failed to save emergency checkpoint: {save_error}")
+        
+        logger.error("=" * 70)
+        logger.error("RECOMMENDATIONS:")
+        logger.error("1. Batch size is already at minimum (1)")
+        logger.error("2. Gradient accumulation is at maximum safe value (16)")
+        logger.error("3. Reduce max_seq_length from 512 to 384 or 256")
+        logger.error("4. Close other GPU-using applications")
+        logger.error("5. Check for memory leaks in custom code")
+        logger.error("=" * 70)
+        
+        return False
     
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user")
@@ -976,7 +1001,7 @@ def main(args):
     print("=" * 70)
     print("DENSITY-AWARE LAYOUTLM TRAINING")
     print("Optimized for: NVIDIA GTX 1650 Ti (4GB VRAM) on Windows")
-    print("Philosophy: Reliability over Speed")
+    print("Philosophy: Reliability over Speed - Zero OOM Crashes")
     print("=" * 70)
     
     # Setup device
@@ -997,6 +1022,23 @@ def main(args):
     # Create output directory
     output_dir = safe_makedirs(Path(args.output_dir))
     logger.info(f"Output directory: {output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Print Effective Hyperparameters Summary (Paper-Grade)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("EFFECTIVE HYPERPARAMETERS SUMMARY")
+    print("=" * 70)
+    print(f"Batch Size (per device): {BATCH_SIZE} (HARDCODED for 4GB VRAM)")
+    print(f"Gradient Accumulation Steps: {GRADIENT_ACCUMULATION_STEPS} (HARDCODED)")
+    print(f"Effective Batch Size: {EFFECTIVE_BATCH_SIZE} (matches research papers)")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning Rate: {args.learning_rate}")
+    print(f"Max Sequence Length: {MAX_SEQ_LENGTH}")
+    print(f"Gradient Checkpointing: ENABLED (memory optimization)")
+    print(f"FP16 Mixed Precision: ENABLED (when CUDA available)")
+    print(f"Windows Data Loading: num_workers={DATALOADER_NUM_WORKERS}, pin_memory={DATALOADER_PIN_MEMORY}")
+    print("=" * 70)
     
     # -------------------------------------------------------------------------
     # Load tokenizer and model
@@ -1027,12 +1069,12 @@ def main(args):
     print_vram_status("After model load | ")
     
     # -------------------------------------------------------------------------
-    # Architecture Verification
+    # Pre-Flight Architecture Verification
     # -------------------------------------------------------------------------
-    print("\n[2/6] Verifying architecture...")
+    print("\n[2/6] Pre-flight architecture verification...")
     
     if not verify_architecture(model, tokenizer, device):
-        logger.error("Architecture verification failed! Aborting.")
+        logger.error("Pre-flight architecture verification failed! Aborting.")
         sys.exit(1)
     
     # -------------------------------------------------------------------------
@@ -1080,18 +1122,16 @@ def main(args):
     print(f"  Pin memory: {DATALOADER_PIN_MEMORY}")
     
     # -------------------------------------------------------------------------
-    # Training arguments - SAFE DEFAULTS
+    # Training arguments - HARDCODED for 4GB VRAM
     # -------------------------------------------------------------------------
-    print("\n[5/6] Configuring training...")
-    
-    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    print("\n[5/6] Configuring training (HARDCODED for 4GB VRAM)...")
     
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        per_device_train_batch_size=BATCH_SIZE,  # HARDCODED
+        per_device_eval_batch_size=BATCH_SIZE,   # HARDCODED
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,  # HARDCODED
         learning_rate=args.learning_rate,
         weight_decay=0.01,
         warmup_ratio=0.1,
@@ -1104,20 +1144,18 @@ def main(args):
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         fp16=torch.cuda.is_available(),  # Mixed precision
-        dataloader_num_workers=DATALOADER_NUM_WORKERS,
-        dataloader_pin_memory=DATALOADER_PIN_MEMORY,
+        dataloader_num_workers=DATALOADER_NUM_WORKERS,  # Windows-safe
+        dataloader_pin_memory=DATALOADER_PIN_MEMORY,    # Windows-safe
         report_to="none",
         remove_unused_columns=False,
-        gradient_checkpointing=True,
+        gradient_checkpointing=True,  # CRITICAL for 4GB VRAM
         optim="adamw_torch",  # Standard PyTorch AdamW (no bitsandbytes)
         max_grad_norm=1.0,  # Gradient clipping for stability
     )
     
-    print(f"  Epochs: {args.epochs}")
-    print(f"  Batch size (per device): {args.batch_size}")
-    print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
-    print(f"  Effective batch size: {effective_batch_size}")
-    print(f"  Learning rate: {args.learning_rate}")
+    print(f"  Batch size (per device): {BATCH_SIZE} (HARDCODED)")
+    print(f"  Gradient accumulation: {GRADIENT_ACCUMULATION_STEPS} (HARDCODED)")
+    print(f"  Effective batch size: {EFFECTIVE_BATCH_SIZE}")
     print(f"  FP16 Mixed Precision: {training_args.fp16}")
     print(f"  Gradient Checkpointing: {training_args.gradient_checkpointing}")
     print(f"  Optimizer: AdamW (torch)")
@@ -1163,10 +1201,10 @@ def main(args):
                 return None
     
     # -------------------------------------------------------------------------
-    # Stratified Evaluation
+    # Stratified Evaluation (Paper-Grade ANLS)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("RUNNING STRATIFIED EVALUATION")
+    print("RUNNING STRATIFIED EVALUATION (Paper-Grade ANLS)")
     print("=" * 70)
     
     clear_memory()
@@ -1174,7 +1212,7 @@ def main(args):
     
     eval_dataloader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=BATCH_SIZE,  # Use hardcoded batch size
         shuffle=False,
         collate_fn=data_collator,
         num_workers=DATALOADER_NUM_WORKERS,
@@ -1212,27 +1250,18 @@ def main(args):
 # ============================================================================
 
 def parse_args():
-    """Parse command line arguments with SAFE defaults for 4GB VRAM."""
+    """
+    Parse command line arguments.
+    NOTE: Batch size and gradient accumulation are HARDCODED and cannot be changed.
+    """
     
     parser = argparse.ArgumentParser(
         description="Train Density-Aware LayoutLM for DocVQA (Optimized for 4GB VRAM)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Training hyperparameters - SAFE DEFAULTS
-    parser.add_argument(
-        "--batch_size", "-b",
-        type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help="Batch size per device (keep at 1 for 4GB VRAM)"
-    )
-    
-    parser.add_argument(
-        "--gradient_accumulation_steps", "-ga",
-        type=int,
-        default=DEFAULT_GRADIENT_ACCUMULATION,
-        help="Gradient accumulation steps (simulates larger batch)"
-    )
+    # Note: batch_size and gradient_accumulation_steps are HARDCODED
+    # They are not exposed as arguments to prevent OOM crashes
     
     parser.add_argument(
         "--learning_rate", "-lr",
@@ -1286,9 +1315,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("CONFIGURATION SUMMARY")
     print("=" * 70)
-    print(f"Batch size: {args.batch_size}")
-    print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
-    print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    print(f"Batch size: {BATCH_SIZE} (HARDCODED - cannot be changed)")
+    print(f"Gradient accumulation: {GRADIENT_ACCUMULATION_STEPS} (HARDCODED - cannot be changed)")
+    print(f"Effective batch size: {EFFECTIVE_BATCH_SIZE}")
     print(f"Epochs: {args.epochs}")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Output: {args.output_dir}")
