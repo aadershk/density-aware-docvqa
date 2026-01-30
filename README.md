@@ -1,6 +1,6 @@
 # Density-Aware LayoutLM for DocVQA
 
-Thesis project: **Density-Aware LayoutLM** for Document Visual Question Answering (DocVQA). It studies how OCR token density affects performance and adds per-token density embeddings to LayoutLM.
+Individual project for the course **Applied AI Seminar**: **Density-Aware LayoutLM** for Document Visual Question Answering (DocVQA). It studies how OCR token density affects performance and adds per-token density embeddings to LayoutLM.
 
 ## Research contribution
 
@@ -26,7 +26,7 @@ Data/cached/train, Data/cached/val                                     (creates 
 src/train_models.py --task baseline | density | density_subset
        │
        ▼  src/eval_models.py
-outputs/FINAL_THESIS_RESULTS.json  (Untrained, Baseline, Density, SOTA — ANLS by group)
+outputs/FINAL_RESULTS.json  (Untrained, Baseline, Density, SOTA — ANLS by group)
 ```
 
 **Order to run:**
@@ -36,7 +36,7 @@ outputs/FINAL_THESIS_RESULTS.json  (Untrained, Baseline, Density, SOTA — ANLS 
 3. **Training**:  
    - `python -m src.train_models --task density_subset` creates the 25% stratified subset (`train_v1.0_subset_25.json`) and **Data/cached/train_subset**, then trains the density model.  
    - `python -m src.train_models --task baseline` or `--task density` then use **Data/cached/train_subset** and **Data/cached/val** (val from step 2).
-4. **Evaluation**: `python -m src.eval_models` loads val cache and runs four setups (Untrained, Baseline, Density, SOTA), prints a table and writes **outputs/FINAL_THESIS_RESULTS.json**.
+4. **Evaluation**: `python -m src.eval_models` loads val cache and runs four setups (Untrained, Baseline, Density, SOTA), prints a table and writes **outputs/FINAL_RESULTS.json**.
 
 ## Project structure
 
@@ -48,14 +48,14 @@ outputs/FINAL_THESIS_RESULTS.json  (Untrained, Baseline, Density, SOTA — ANLS 
 │   └── cache_data.py              # Pre-tokenize to Data/cached/train & val (removes CPU bottleneck)
 ├── src/
 │   ├── train_models.py             # --task baseline | density | density_subset
-│   └── eval_models.py              # Four evals → FINAL_THESIS_RESULTS.json
+│   └── eval_models.py              # Four evals → FINAL_RESULTS.json
 ├── Data/                           # Not in repo
 │   ├── train_v1.0_withQT.json
 │   ├── val_v1.0_withQT.json
 │   ├── ocr/                         # OCR JSONs per document
 │   ├── prepared/                   # From stratified_data_setup.py
 │   └── cached/                     # From cache_data.py & train_models (train_subset)
-└── outputs/                        # Checkpoints, metrics, FINAL_THESIS_RESULTS.json
+└── outputs/                        # Checkpoints, metrics, FINAL_RESULTS.json
 ```
 
 ## Setup
@@ -152,7 +152,7 @@ Outputs: `outputs/baseline_experiment/` or `outputs/subset_experiment/` (final m
 python -m src.eval_models
 ```
 
-Runs: **Untrained** (base LayoutLM), **Baseline** (trained, no density), **Density** (trained with density), **SOTA** (Impira LayoutLM-Document-QA). Requires **Data/cached/val** and trained checkpoints for Baseline/Density. Writes **outputs/FINAL_THESIS_RESULTS.json** and prints ANLS (%) by Sparse / Medium / Dense / Overall.
+Runs: **Untrained** (base LayoutLM), **Baseline** (trained, no density), **Density** (trained with density), **SOTA** (Impira LayoutLM-Document-QA). Requires **Data/cached/val** and trained checkpoints for Baseline/Density. Writes **outputs/FINAL_RESULTS.json** and prints ANLS (%) by Sparse / Medium / Dense / Overall.
 
 ## Metrics
 
@@ -166,5 +166,5 @@ Runs: **Untrained** (base LayoutLM), **Baseline** (trained, no density), **Densi
 | `scripts/stratified_data_setup.py` | Merge OCR + QA; 33/66 percentiles; per-token density; write prepared JSON/JSONL. |
 | `scripts/cache_data.py` | Offline tokenization → Data/cached/train & val for fast loading. |
 | `src/train_models.py` | Baseline and DensityAwareLayoutLM training; density_subset builds 25% subset + train_subset cache. |
-| `src/eval_models.py` | Runs four evals on val cache (and Impira on raw val); writes FINAL_THESIS_RESULTS.json. |
+| `src/eval_models.py` | Runs four evals on val cache (and Impira on raw val); writes FINAL_RESULTS.json. |
 | `DocVQA_EDA.ipynb` | EDA and density vs performance analysis. |

@@ -1,4 +1,4 @@
-"""Run all four evals (Untrained, Baseline, Density, SOTA). Writes outputs/FINAL_THESIS_RESULTS.json."""
+"""Run all four evals (Untrained, Baseline, Density, SOTA). Writes outputs/FINAL_RESULTS.json."""
 
 import json
 import logging
@@ -36,7 +36,7 @@ VAL_CACHE  = CACHE_DIR / "val"
 VAL_JSON   = PREPARED_DIR / "val_v1.0_prepared.json"
 OUTPUT_BASELINE = BASE_DIR / "outputs" / "baseline_experiment"
 OUTPUT_DENSITY  = BASE_DIR / "outputs" / "subset_experiment"
-FINAL_RESULTS_JSON = BASE_DIR / "outputs" / "FINAL_THESIS_RESULTS.json"
+FINAL_RESULTS_JSON = BASE_DIR / "outputs" / "FINAL_RESULTS.json"
 
 MODEL_NAME = "microsoft/layoutlm-base-uncased"
 MAX_SEQ_LENGTH     = 512
@@ -406,7 +406,7 @@ def run_eval():
             logger.exception(f"FAILED {name}: {e}")
             final_results[name] = {"Sparse": 0.0, "Medium": 0.0, "Dense": 0.0, "Overall": 0.0}
     print("\n" + "=" * 75)
-    print("FINAL THESIS RESULTS — ANLS (%) by Density Group")
+    print("FINAL RESULTS — ANLS (%) by Density Group")
     print("=" * 75)
     print(f"{'Model':<14} | {'Sparse':>8} | {'Medium':>8} | {'Dense':>8} | {'Overall':>8}")
     print("-" * 75)
