@@ -60,43 +60,66 @@ outputs/FINAL_THESIS_RESULTS.json  (Untrained, Baseline, Density, SOTA — ANLS 
 
 ## Setup
 
-### 1. Clone and environment
+### Option A: Quick start (pre-prepared Data — recommended for grading)
 
-```bash
-git clone <repo-url>
-cd "Final Induvidual Assignment"
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
-source .venv/bin/activate
-```
+Use this if you want to run training/evaluation without regenerating data.
 
-### 2. Dependencies
+1. **Clone the repo**
+   ```bash
+   git clone https://github.com/aadershk/density-aware-docvqa.git
+   cd density-aware-docvqa
+   ```
 
-```bash
-pip install torch transformers datasets tqdm numpy
-```
+2. **Download the `Data` folder**  
+   The repository does not include `Data/` (it is gitignored). Download the pre-prepared Data from:
+   - **Google Drive:** [Data folder](https://drive.google.com/drive/folders/1IOyILPb1D-ot77dXlpElSL3UKNWO7W6Z?usp=sharing)  
+   The folder contains: `cached/`, `images/`, `ocr/`, `outputs/`, `prepared/`, and optionally `spdocvqa_ocr.tar.gz` (raw OCR archive).
 
-(Optional: add `accelerate` for training. Python 3.8+, PyTorch 2.x, Transformers 4.30+.)
+3. **Place `Data` in the project root**  
+   After downloading, extract or move the folder so that your project directory looks like:
+   ```
+   density-aware-docvqa/
+   ├── Data/          ← the downloaded folder (with cached/, prepared/, ocr/, etc. inside)
+   ├── scripts/
+   ├── src/
+   ├── DocVQA_EDA.ipynb
+   └── README.md
+   ```
+   You should have `Data/cached/val`, `Data/prepared/`, etc. Then you can run training and evaluation (see below) without running data-prep or caching scripts.
 
-### 3. DocVQA data
+4. **Environment and dependencies**
+   ```bash
+   python -m venv .venv
+   # Windows: .venv\Scripts\activate
+   # Linux/macOS: source .venv/bin/activate
+   pip install torch transformers datasets tqdm numpy
+   ```
+   (Python 3.8+; PyTorch 2.x, Transformers 4.30+. For grading we use Python 3.13.)
 
-Put DocVQA JSONs and OCR under `Data/`:
+---
 
-- `Data/train_v1.0_withQT.json`, `Data/val_v1.0_withQT.json`
-- `Data/ocr/` — one JSON per document (OCR with words/boxes)
+### Option B: From scratch (raw DocVQA)
 
-### 4. Prepare data and cache
+Use this if you have the official DocVQA dataset and want to regenerate everything.
 
-```bash
-# Prepared train/val with density groups and per-token density scores
-python scripts/stratified_data_setup.py
+1. **Clone and environment** — same as Option A (clone repo, create venv, activate).
 
-# Val cache (required for training and eval). For train cache, need train subset;
-# density_subset creates train_v1.0_subset_25.json — copy to train_v1.0_subset.json if using cache_data for both.
-python scripts/cache_data.py
-```
+2. **Dependencies**
+   ```bash
+   pip install torch transformers datasets tqdm numpy
+   ```
+
+3. **DocVQA data**  
+   Put raw DocVQA JSONs and OCR under `Data/`:
+   - `Data/train_v1.0_withQT.json`, `Data/val_v1.0_withQT.json`
+   - `Data/ocr/` — one JSON per document (OCR with words/boxes)
+
+4. **Prepare data and cache**
+   ```bash
+   python scripts/stratified_data_setup.py
+   python scripts/cache_data.py
+   ```
+   (For `cache_data.py` you may need a train subset; see *Project flow* above.)
 
 ## Training
 
