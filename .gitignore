@@ -66,3 +66,50 @@ wandb/
 
 # HuggingFace cache
 .huggingface/
+
+# Added by cleanup_project.py
+# Data
+Data/ocr/
+Data/images/
+Data/cached/
+*.tar.gz
+*.zip
+
+# Virtual Env
+.venv/
+env/
+venv/
+
+# Model Outputs
+outputs/
+*.bin
+*.pt
+*.safetensors
+
+# Logs & Cache
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.ipynb_checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+temp_*.json
+*.tmp
+*.bak
+

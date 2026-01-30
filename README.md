@@ -1,139 +1,152 @@
 # Density-Aware LayoutLM for DocVQA
 
-A research project implementing a **Density-Aware LayoutLM** model for Document Visual Question Answering (DocVQA). This work investigates how OCR token density affects model performance and introduces a novel approach to inject local density information into the LayoutLM architecture.
+Thesis project: **Density-Aware LayoutLM** for Document Visual Question Answering (DocVQA). It studies how OCR token density affects performance and adds per-token density embeddings to LayoutLM.
 
-## Research Contribution
+## Research contribution
 
-The key innovation is the identification of **OCR density** as a critical failure variable in document understanding models. Documents with high token density (dense documents) consistently show degraded performance. This project:
+- **Problem**: EDA shows that performance drops on dense documents (high token density).
+- **Approach**: Custom `DensityAwareLayoutLM` that injects local density embeddings via a small projection layer.
+- **Evaluation**: Stratified metrics (Sparse / Medium / Dense) and comparison with baseline and SOTA (Impira).
 
-1. **Identifies the problem**: Through EDA, we show that model performance degrades significantly on dense documents
-2. **Proposes a solution**: A custom `DensityAwareLayoutLM` that injects per-token local density embeddings
-3. **Provides stratified evaluation**: Metrics broken down by density groups (Sparse, Medium, Dense) to measure the effectiveness
-
-## Architecture
-
-The `DensityAwareLayoutLM` extends `LayoutLMForQuestionAnswering` with:
-- A **density projection layer** (`nn.Linear(1, hidden_size)`) that converts scalar density scores to embeddings
-- **Density embedding injection** before the transformer encoder
-- Support for the standard LayoutLM Question Answering task
-
-```python
-# Core innovation
-density_embeds = self.density_projection(density_scores.unsqueeze(-1))
-inputs_embeds = inputs_embeds + density_embeds
-```
-
-## Project Structure
+## Project flow
 
 ```
-├── DocVQA_EDA.ipynb          # Exploratory Data Analysis notebook
-├── stratified_data_setup.py  # Data preparation with density features
-├── train_density_model.py    # Training script with custom model
-├── requirements.txt          # Python dependencies
-├── Data/                     # Dataset (not in repo - see setup)
+Data (DocVQA + OCR)
+       │
+       ▼  scripts/stratified_data_setup.py
+Data/prepared/  (train/val prepared JSON + density_group, token_density_scores)
+       │
+       ├───────────────────────────────────────────────────────────────┐
+       │                                                               │
+       ▼  scripts/cache_data.py (optional)                             ▼  src/train_models.py --task density_subset
+Data/cached/train, Data/cached/val                                     (creates train_v1.0_subset_25.json + Data/cached/train_subset)
+       │                                                               │
+       │  Val cache required for training & evaluation                 │  train_subset + val cache required for baseline/density
+       ▼                                                               ▼
+src/train_models.py --task baseline | density | density_subset
+       │
+       ▼  src/eval_models.py
+outputs/FINAL_THESIS_RESULTS.json  (Untrained, Baseline, Density, SOTA — ANLS by group)
+```
+
+**Order to run:**
+
+1. **Data prep**: `scripts/stratified_data_setup.py` → `Data/prepared/` (train/val JSON + JSONL, `density_thresholds.json`).
+2. **Val cache** (needed for training and eval): Run `scripts/cache_data.py`. It expects `Data/prepared/val_v1.0_prepared.json` and, for train cache, `Data/prepared/train_v1.0_subset.json` (or `.jsonl`). If you only need the val cache for eval/training, you can create a minimal train subset or run `density_subset` once (see below) and then run `cache_data` after copying `train_v1.0_subset_25.json` to `train_v1.0_subset.json`.
+3. **Training**:  
+   - `python -m src.train_models --task density_subset` creates the 25% stratified subset (`train_v1.0_subset_25.json`) and **Data/cached/train_subset**, then trains the density model.  
+   - `python -m src.train_models --task baseline` or `--task density` then use **Data/cached/train_subset** and **Data/cached/val** (val from step 2).
+4. **Evaluation**: `python -m src.eval_models` loads val cache and runs four setups (Untrained, Baseline, Density, SOTA), prints a table and writes **outputs/FINAL_THESIS_RESULTS.json**.
+
+## Project structure
+
+```
+├── DocVQA_EDA.ipynb          # EDA: density vs performance, failure modes
+├── README.md
+├── scripts/
+│   ├── stratified_data_setup.py   # OCR + QA → prepared JSON with density groups & token scores
+│   └── cache_data.py              # Pre-tokenize to Data/cached/train & val (removes CPU bottleneck)
+├── src/
+│   ├── train_models.py             # --task baseline | density | density_subset
+│   └── eval_models.py              # Four evals → FINAL_THESIS_RESULTS.json
+├── Data/                           # Not in repo
 │   ├── train_v1.0_withQT.json
 │   ├── val_v1.0_withQT.json
-│   ├── test_v1.0_withQT.json
-│   ├── ocr/                  # OCR JSON files
-│   └── prepared/             # Processed data with density features
-└── outputs/                  # Model checkpoints and results
+│   ├── ocr/                         # OCR JSONs per document
+│   ├── prepared/                   # From stratified_data_setup.py
+│   └── cached/                     # From cache_data.py & train_models (train_subset)
+└── outputs/                        # Checkpoints, metrics, FINAL_THESIS_RESULTS.json
 ```
 
 ## Setup
 
-### 1. Clone the repository
-```bash
-git clone https://github.com/YOUR_USERNAME/density-aware-docvqa.git
-cd density-aware-docvqa
-```
+### 1. Clone and environment
 
-### 2. Create virtual environment
 ```bash
+git clone <repo-url>
+cd "Final Induvidual Assignment"
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
-# Linux/Mac
+# Linux/macOS
 source .venv/bin/activate
 ```
 
-### 3. Install dependencies
+### 2. Dependencies
+
 ```bash
-pip install -r requirements.txt
+pip install torch transformers datasets tqdm numpy
 ```
 
-### 4. Download DocVQA Dataset
-Download the DocVQA dataset from the [official source](https://www.docvqa.org/) and place it in the `Data/` directory.
+(Optional: add `accelerate` for training. Python 3.8+, PyTorch 2.x, Transformers 4.30+.)
 
-### 5. Prepare the data
+### 3. DocVQA data
+
+Put DocVQA JSONs and OCR under `Data/`:
+
+- `Data/train_v1.0_withQT.json`, `Data/val_v1.0_withQT.json`
+- `Data/ocr/` — one JSON per document (OCR with words/boxes)
+
+### 4. Prepare data and cache
+
 ```bash
-python stratified_data_setup.py
-```
+# Prepared train/val with density groups and per-token density scores
+python scripts/stratified_data_setup.py
 
-This will:
-- Calculate density percentiles (33rd, 66th) from training data
-- Assign density groups (Sparse, Medium, Dense) to each document
-- Compute per-token local density scores (neighbors within 50px radius)
-- Save prepared data to `Data/prepared/`
+# Val cache (required for training and eval). For train cache, need train subset;
+# density_subset creates train_v1.0_subset_25.json — copy to train_v1.0_subset.json if using cache_data for both.
+python scripts/cache_data.py
+```
 
 ## Training
 
 ```bash
-python train_density_model.py \
-    --batch_size 4 \
-    --epochs 3 \
-    --learning_rate 5e-5 \
-    --gradient_checkpointing
+# 25% stratified subset + train density model (creates train_subset cache)
+python -m src.train_models --task density_subset
+
+# Baseline (LayoutLM, no density)
+python -m src.train_models --task baseline
+
+# Density model (same data as baseline; use after train_subset exists)
+python -m src.train_models --task density
 ```
 
-### Arguments
 | Argument | Default | Description |
-|----------|---------|-------------|
-| `--batch_size` | 4 | Batch size for training |
-| `--epochs` | 3 | Number of training epochs |
-| `--learning_rate` | 5e-5 | Learning rate |
-| `--output_dir` | `outputs/density_model` | Output directory |
-| `--gradient_checkpointing` | False | Enable to reduce memory usage |
-| `--eval_only` | False | Skip training, only evaluate |
+|----------|---------|--------------|
+| `--task` | required | `baseline`, `density`, or `density_subset` |
+| `--output_dir` | task-specific | Checkpoint dir |
+| `--per_device_train_batch_size` | 2 | Batch size |
+| `--gradient_accumulation_steps` | 16 | Effective batch size |
+| `--epochs` | 3 | Epochs |
+| `--learning_rate` | 3e-5 | LR |
+| `--resume_from_checkpoint` | False | For density/density_subset |
 
-### Output
-- Model checkpoints saved each epoch
-- `stratified_metrics.json` with performance by density group
-- Comparison table showing Sparse vs Medium vs Dense performance
+Outputs: `outputs/baseline_experiment/` or `outputs/subset_experiment/` (final model, metrics).
+
+## Evaluation
+
+```bash
+python -m src.eval_models
+```
+
+Runs: **Untrained** (base LayoutLM), **Baseline** (trained, no density), **Density** (trained with density), **SOTA** (Impira LayoutLM-Document-QA). Requires **Data/cached/val** and trained checkpoints for Baseline/Density. Writes **outputs/FINAL_THESIS_RESULTS.json** and prints ANLS (%) by Sparse / Medium / Dense / Overall.
 
 ## Metrics
 
-The project uses:
-- **ANLS** (Average Normalized Levenshtein Similarity) - standard DocVQA metric
-- **Exact Match** - strict matching accuracy
+- **ANLS** (Average Normalized Levenshtein Similarity), threshold 0.5
+- Results stratified by density group (Sparse / Medium / Dense)
 
-Results are stratified by density group to reveal the performance gap on dense documents.
+## Key files
 
-## Key Files
-
-### `stratified_data_setup.py`
-- Loads raw DocVQA JSONs and OCR files
-- Computes document-level `ocr_density` (total token count)
-- Computes per-token `token_density_scores` (local neighborhood density)
-- Assigns `density_group` labels based on percentiles
-- Uses multiprocessing for efficient computation
-
-### `train_density_model.py`
-- Implements `DensityAwareLayoutLM` model class
-- Custom `DocVQADataCollator` for subword-density alignment
-- `DensityAwareTrainer` for handling custom forward pass
-- Stratified evaluation by density group
-- ANLS metric implementation
-
-## Requirements
-
-- Python 3.8+
-- PyTorch 2.0+
-- Transformers 4.30+
-- CUDA-capable GPU (recommended)
+| File | Role |
+|------|------|
+| `scripts/stratified_data_setup.py` | Merge OCR + QA; 33/66 percentiles; per-token density; write prepared JSON/JSONL. |
+| `scripts/cache_data.py` | Offline tokenization → Data/cached/train & val for fast loading. |
+| `src/train_models.py` | Baseline and DensityAwareLayoutLM training; density_subset builds 25% subset + train_subset cache. |
+| `src/eval_models.py` | Runs four evals on val cache (and Impira on raw val); writes FINAL_THESIS_RESULTS.json. |
+| `DocVQA_EDA.ipynb` | EDA and density vs performance analysis. |
 
 ## Citation
-
-If you use this work, please cite:
 
 ```bibtex
 @misc{density-aware-docvqa,
