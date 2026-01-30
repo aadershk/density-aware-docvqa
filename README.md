@@ -168,18 +168,3 @@ Runs: **Untrained** (base LayoutLM), **Baseline** (trained, no density), **Densi
 | `src/train_models.py` | Baseline and DensityAwareLayoutLM training; density_subset builds 25% subset + train_subset cache. |
 | `src/eval_models.py` | Runs four evals on val cache (and Impira on raw val); writes FINAL_THESIS_RESULTS.json. |
 | `DocVQA_EDA.ipynb` | EDA and density vs performance analysis. |
-
-## Citation
-
-```bibtex
-@misc{density-aware-docvqa,
-  title={Density-Aware LayoutLM for Document Visual Question Answering},
-  author={Your Name},
-  year={2026},
-  howpublished={GitHub}
-}
-```
-
-## License
-
-MIT License
